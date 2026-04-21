@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "milvus": {
+      "source": "zilliztech/milvus-skill",
+      "sourceType": "github",
+      "computedHash": "b8ed5af6d44077ac70a57f090541ceb24d2ab0b21646e4e25b4a4c4db3f4b850"
+    }
+  }
+}

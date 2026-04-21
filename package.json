@@ -1,0 +1,29 @@
+{
+  "name": "video-similarity",
+  "version": "1.0.0",
+  "description": "Video embedding, PostgreSQL persistence, and clustering pipeline",
+  "main": "index.js",
+  "scripts": {
+    "videos:download": "node scripts/download-videos-from-csv.js",
+    "videos:embed": "node scripts/embed-videos-to-postgres.js",
+    "videos:cluster": "node scripts/cluster-videos.js",
+    "videos:write-clusters": "node scripts/write-clusters-to-csv.js",
+    "videos:batch": "node scripts/process-skus.js",
+    "videos:pipeline": "node scripts/embed-cluster-videos.js",
+    "videos:dry-run": "DRY_RUN=1 node scripts/embed-cluster-videos.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "packageManager": "pnpm@10.33.0",
+  "dependencies": {
+    "@google/genai": "^1.50.1",
+    "csv-parse": "^6.2.1",
+    "dotenv": "^17.4.2",
+    "drizzle-orm": "^0.45.2",
+    "p-map": "^7.0.4",
+    "pg": "^8.20.0",
+    "xlsx": "^0.18.5"
+  }
+}
