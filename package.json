@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "videos:download": "node scripts/download-videos-from-csv.js",
-    "videos:embed": "node scripts/embed-videos-to-postgres.js",
+    "videos:embed": "node scripts/embed-videos.js",
     "videos:cluster": "node scripts/cluster-videos.js",
     "videos:write-clusters": "node scripts/write-clusters-to-csv.js",
     "videos:batch": "node scripts/process-skus.js",

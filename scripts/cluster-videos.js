@@ -193,54 +193,12 @@ function clusterEmbeddings(records, config) {
     return clusters;
   }
 
-  function buildSingleLinkageClusters() {
-    const parents = Array.from({ length: normalized.length }, (_, index) => index);
-
-    function find(index) {
-      if (parents[index] !== index) {
-        parents[index] = find(parents[index]);
-      }
-      return parents[index];
-    }
-
-    function union(a, b) {
-      const rootA = find(a);
-      const rootB = find(b);
-      if (rootA !== rootB) {
-        parents[rootB] = rootA;
-      }
-    }
-
-    for (let i = 0; i < normalized.length; i += 1) {
-      for (let j = i + 1; j < normalized.length; j += 1) {
-        if (scoreMatrix[i][j] >= config.clusterThreshold) {
-          union(i, j);
-        }
-      }
-    }
-
-    const groups = new Map();
-    for (let i = 0; i < normalized.length; i += 1) {
-      const root = find(i);
-      if (!groups.has(root)) {
-        groups.set(root, []);
-      }
-      groups.get(root).push(i);
-    }
-
-    return Array.from(groups.values());
-  }
-
-  let clusters;
-  if (config.clusterAlgorithm === "single-linkage") {
-    clusters = buildSingleLinkageClusters();
-  } else if (config.clusterAlgorithm === "complete-linkage") {
-    clusters = buildCompleteLinkageClusters();
-  } else {
+  if (config.clusterAlgorithm !== "complete-linkage") {
     throw new Error(
-      `Unsupported cluster algorithm: ${config.clusterAlgorithm}. Use complete-linkage or single-linkage.`,
+      `Unsupported cluster algorithm: ${config.clusterAlgorithm}. Use complete-linkage.`,
     );
   }
+  const clusters = buildCompleteLinkageClusters();
 
   return clusters
     .map((memberIndexes, index) => ({

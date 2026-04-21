@@ -97,7 +97,7 @@ async function processSku(sku, threshold, index, total) {
 
   const startedAt = Date.now();
   const downloadResult = await runDownloadWithRetry(sku);
-  await runNodeScript("embed-videos-to-postgres.js", [sku]);
+  await runNodeScript("embed-videos.js", [sku]);
   await runNodeScript("cluster-videos.js", [sku, threshold]);
 
   return {

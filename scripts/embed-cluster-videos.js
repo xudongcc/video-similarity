@@ -5,11 +5,8 @@ require("dotenv").config({ quiet: true });
 
 const { parse } = require("csv-parse/sync");
 const { GoogleGenAI } = require("@google/genai");
-const {
-  MilvusClient,
-  DataType,
-  MetricType,
-} = require("@zilliz/milvus2-sdk-node");
+
+const { createVideoEmbeddingsStore } = require("./lib/postgres-video-store");
 
 const DEFAULTS = {
   csvPath: "LF10333042去重素材.csv",
@@ -17,8 +14,6 @@ const DEFAULTS = {
   outputsDir: "outputs",
   embeddingModel: "gemini-embedding-2-preview",
   geminiApiKey: "",
-  milvusAddress: "192.168.66.201:19530",
-  milvusCollection: "videos",
   fixedSku: "LF10333042",
   skuField: "material_id",
   md5Field: "video_md5",
@@ -31,7 +26,7 @@ const DEFAULTS = {
   clusterThreshold: 0.95,
   pairPreviewLimit: 50,
   dryRun: false,
-  skipExistingInMilvus: true,
+  skipExistingEmbeddings: true,
   clusterAlgorithm: "complete-linkage",
   audioTrackExtraction: false,
   videoFps: null,
@@ -73,8 +68,18 @@ function readEnvBoolean(name, fallback) {
   return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
 }
 
+function readEnvBooleanAny(names, fallback) {
+  for (const name of names) {
+    if (process.env[name] !== undefined && process.env[name] !== "") {
+      return readEnvBoolean(name, fallback);
+    }
+  }
+  return fallback;
+}
+
 function buildConfig() {
   return {
+    databaseUrl: process.env.DATABASE_URL || "",
     csvPath: path.resolve(process.cwd(), process.env.CSV_PATH || DEFAULTS.csvPath),
     downloadsDir: path.resolve(
       process.cwd(),
@@ -89,8 +94,6 @@ function buildConfig() {
       process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
       process.env.GOOGLE_API_KEY ||
       DEFAULTS.geminiApiKey,
-    milvusAddress: process.env.MILVUS_ADDRESS || DEFAULTS.milvusAddress,
-    milvusCollection: process.env.MILVUS_COLLECTION || DEFAULTS.milvusCollection,
     fixedSku: process.env.FIXED_SKU || DEFAULTS.fixedSku,
     skuField: process.env.SKU_FIELD || DEFAULTS.skuField,
     md5Field: process.env.MD5_FIELD || DEFAULTS.md5Field,
@@ -129,9 +132,9 @@ function buildConfig() {
     clusterAlgorithm:
       process.env.CLUSTER_ALGORITHM || DEFAULTS.clusterAlgorithm,
     dryRun: readEnvBoolean("DRY_RUN", DEFAULTS.dryRun),
-    skipExistingInMilvus: readEnvBoolean(
-      "SKIP_EXISTING_IN_MILVUS",
-      DEFAULTS.skipExistingInMilvus,
+    skipExistingEmbeddings: readEnvBooleanAny(
+      ["SKIP_EXISTING_EMBEDDINGS"],
+      DEFAULTS.skipExistingEmbeddings,
     ),
     audioTrackExtraction: readEnvBoolean(
       "AUDIO_TRACK_EXTRACTION",
@@ -155,6 +158,11 @@ function buildConfig() {
 }
 
 function ensureLocalInputs(config) {
+  if (!config.databaseUrl) {
+    throw new Error(
+      "Missing DATABASE_URL. Set it in .env or the shell before running.",
+    );
+  }
   if (!fs.existsSync(config.csvPath)) {
     throw new Error(`CSV file not found: ${config.csvPath}`);
   }
@@ -224,123 +232,6 @@ function loadRecords(config) {
   }
 
   return records;
-}
-
-async function ensureCollection(client, config) {
-  const existing = await client.listCollections();
-  const names = new Set(existing.collection_names || []);
-
-  if (!names.has(config.milvusCollection)) {
-    await client.createCollection({
-      collection_name: config.milvusCollection,
-      fields: [
-        {
-          name: "md5",
-          data_type: DataType.VarChar,
-          is_primary_key: true,
-          autoID: false,
-          max_length: 32,
-        },
-        {
-          name: "sku",
-          data_type: DataType.VarChar,
-          max_length: 256,
-        },
-        {
-          name: "embedding",
-          data_type: DataType.FloatVector,
-          dim: config.outputDimensionality,
-        },
-      ],
-      index_params: [
-        {
-          field_name: "embedding",
-          index_type: "AUTOINDEX",
-          metric_type: MetricType.COSINE,
-        },
-      ],
-      enable_dynamic_field: false,
-    });
-  }
-
-  const description = await client.describeCollection({
-    collection_name: config.milvusCollection,
-  });
-
-  const embeddingField = description?.anns_fields?.embedding;
-  const dim = Number(embeddingField?.dim);
-  const md5Field = description?.scalar_fields?.md5;
-  const skuField = description?.scalar_fields?.sku;
-
-  if (!md5Field) {
-    throw new Error(
-      `Milvus collection ${config.milvusCollection} is missing the md5 field.`,
-    );
-  }
-
-  if (!md5Field.is_primary_key) {
-    throw new Error(
-      `Milvus collection ${config.milvusCollection} has md5, but it is not the primary key. md5 must be unique in Milvus.`,
-    );
-  }
-
-  if (!skuField) {
-    throw new Error(
-      `Milvus collection ${config.milvusCollection} is missing the sku field.`,
-    );
-  }
-
-  if (!embeddingField || dim !== config.outputDimensionality) {
-    throw new Error(
-      `Milvus collection ${config.milvusCollection} has embedding dim ${dim}, expected ${config.outputDimensionality}.`,
-    );
-  }
-
-  return description;
-}
-
-function chunkArray(items, chunkSize) {
-  const chunks = [];
-  for (let i = 0; i < items.length; i += chunkSize) {
-    chunks.push(items.slice(i, i + chunkSize));
-  }
-  return chunks;
-}
-
-async function fetchExistingRecords(client, config, records) {
-  if (!config.skipExistingInMilvus || records.length === 0) {
-    return new Map();
-  }
-
-  const found = new Map();
-  const chunks = chunkArray(
-    records.map((record) => record.md5),
-    config.queryChunkSize,
-  );
-
-  for (const chunk of chunks) {
-    const filter = `md5 in [${chunk.map((md5) => JSON.stringify(md5)).join(", ")}]`;
-    const response = await client.query({
-      collection_name: config.milvusCollection,
-      filter,
-      output_fields: ["md5", "sku", "embedding"],
-      limit: chunk.length,
-    });
-
-    for (const item of response.data || []) {
-      if (!item.md5 || !Array.isArray(item.embedding)) {
-        continue;
-      }
-      found.set(item.md5, {
-        md5: item.md5,
-        sku: item.sku || item.md5,
-        embedding: item.embedding,
-        source: "milvus",
-      });
-    }
-  }
-
-  return found;
 }
 
 function getMimeType(filePath) {
@@ -466,20 +357,6 @@ async function embedRecordWithRetry(ai, record, config) {
   throw lastError;
 }
 
-async function upsertEmbeddings(client, config, rows) {
-  const chunks = chunkArray(rows, config.upsertBatchSize);
-  for (const chunk of chunks) {
-    await client.upsert({
-      collection_name: config.milvusCollection,
-      data: chunk.map((item) => ({
-        md5: item.md5,
-        sku: item.sku,
-        embedding: item.embedding,
-      })),
-    });
-  }
-}
-
 function normalizeVector(values) {
   let sum = 0;
   for (const value of values) {
@@ -494,8 +371,8 @@ function normalizeVector(values) {
 
 function cosineSimilarity(normalizedA, normalizedB) {
   let total = 0;
-  for (let i = 0; i < normalizedA.length; i += 1) {
-    total += normalizedA[i] * normalizedB[i];
+  for (let index = 0; index < normalizedA.length; index += 1) {
+    total += normalizedA[index] * normalizedB[index];
   }
   return total;
 }
@@ -530,45 +407,56 @@ function clusterEmbeddings(records, config) {
     }
   }
 
-  const clusters = normalized.map((_, index) => [index]);
+  function buildCompleteLinkageClusters() {
+    const clusters = normalized.map((_, index) => [index]);
 
-  function clusterScore(clusterA, clusterB) {
-    let minScore = Infinity;
-    for (const indexA of clusterA) {
-      for (const indexB of clusterB) {
-        const score = scoreMatrix[indexA][indexB];
-        if (score < minScore) {
-          minScore = score;
+    function clusterScore(clusterA, clusterB) {
+      let minScore = Infinity;
+      for (const indexA of clusterA) {
+        for (const indexB of clusterB) {
+          const score = scoreMatrix[indexA][indexB];
+          if (score < minScore) {
+            minScore = score;
+          }
         }
       }
+      return minScore;
     }
-    return minScore;
-  }
 
-  while (clusters.length > 1) {
-    let bestI = -1;
-    let bestJ = -1;
-    let bestScore = -Infinity;
+    while (clusters.length > 1) {
+      let bestI = -1;
+      let bestJ = -1;
+      let bestScore = -Infinity;
 
-    for (let i = 0; i < clusters.length; i += 1) {
-      for (let j = i + 1; j < clusters.length; j += 1) {
-        const score = clusterScore(clusters[i], clusters[j]);
-        if (score > bestScore) {
-          bestScore = score;
-          bestI = i;
-          bestJ = j;
+      for (let i = 0; i < clusters.length; i += 1) {
+        for (let j = i + 1; j < clusters.length; j += 1) {
+          const score = clusterScore(clusters[i], clusters[j]);
+          if (score > bestScore) {
+            bestScore = score;
+            bestI = i;
+            bestJ = j;
+          }
         }
       }
+
+      if (bestScore < config.clusterThreshold || bestI === -1 || bestJ === -1) {
+        break;
+      }
+
+      const merged = [...clusters[bestI], ...clusters[bestJ]];
+      clusters[bestI] = merged;
+      clusters.splice(bestJ, 1);
     }
 
-    if (bestScore < config.clusterThreshold || bestI === -1 || bestJ === -1) {
-      break;
-    }
-
-    const merged = [...clusters[bestI], ...clusters[bestJ]];
-    clusters[bestI] = merged;
-    clusters.splice(bestJ, 1);
+    return clusters;
   }
+
+  if (config.clusterAlgorithm !== "complete-linkage") {
+    throw new Error(
+      `Unsupported cluster algorithm: ${config.clusterAlgorithm}. Use complete-linkage.`,
+    );
+  }
+  const clusters = buildCompleteLinkageClusters();
 
   const formattedClusters = clusters
     .map((memberIndexes, index) => ({
@@ -618,143 +506,142 @@ async function main() {
         dryRun: config.dryRun,
         clusterAlgorithm: config.clusterAlgorithm,
         hasGeminiApiKey: Boolean(config.geminiApiKey),
-        milvusAddress: config.milvusAddress,
-        collection: config.milvusCollection,
+        storageBackend: "postgres",
       },
       null,
       2,
     ),
   );
 
-  const milvus = new MilvusClient({ address: config.milvusAddress });
-  const collectionDescription = await ensureCollection(milvus, config);
+  const store = createVideoEmbeddingsStore(config);
 
-  if (!config.dryRun && !config.geminiApiKey) {
-    throw new Error(
-      "Missing Gemini authentication. Set GOOGLE_GENERATIVE_AI_API_KEY before running the pipeline.",
-    );
-  }
+  try {
+    const databaseDescription = await store.ensureSchema();
 
-  const existingByMd5 = await fetchExistingRecords(milvus, config, withFiles);
-  const recordsToEmbed = withFiles.filter((record) => !existingByMd5.has(record.md5));
-
-  let embeddedRows = [];
-  if (!config.dryRun && recordsToEmbed.length > 0) {
-    const ai = new GoogleGenAI({
-      apiKey: config.geminiApiKey,
-    });
-
-    const pendingUpserts = [];
-    for (let index = 0; index < recordsToEmbed.length; index += 1) {
-      const record = recordsToEmbed[index];
-      console.log(
-        `[embed ${index + 1}/${recordsToEmbed.length}] ${record.md5} ${path.basename(record.localPath)}`,
+    if (!config.dryRun && !config.geminiApiKey) {
+      throw new Error(
+        "Missing Gemini authentication. Set GOOGLE_GENERATIVE_AI_API_KEY before running the pipeline.",
       );
-      const embedding = await embedRecordWithRetry(ai, record, config);
-      const row = {
-        md5: record.md5,
-        sku: record.sku,
-        localPath: record.localPath,
-        source: "vertex",
-        embedding,
-      };
-      embeddedRows.push(row);
-      pendingUpserts.push(row);
+    }
 
-      if (pendingUpserts.length >= config.upsertBatchSize) {
-        await upsertEmbeddings(milvus, config, pendingUpserts.splice(0, pendingUpserts.length));
+    const existingByMd5 = config.skipExistingEmbeddings
+      ? await store.fetchExistingRecords(withFiles, config.queryChunkSize)
+      : new Map();
+    const recordsToEmbed = withFiles.filter((record) => !existingByMd5.has(record.md5));
+
+    let embeddedRows = [];
+    if (!config.dryRun && recordsToEmbed.length > 0) {
+      const ai = new GoogleGenAI({
+        apiKey: config.geminiApiKey,
+      });
+
+      const pendingUpserts = [];
+      for (let index = 0; index < recordsToEmbed.length; index += 1) {
+        const record = recordsToEmbed[index];
+        console.log(
+          `[embed ${index + 1}/${recordsToEmbed.length}] ${record.md5} ${path.basename(record.localPath)}`,
+        );
+        const embedding = await embedRecordWithRetry(ai, record, config);
+        const row = {
+          md5: record.md5,
+          sku: record.sku,
+          localPath: record.localPath,
+          source: "vertex",
+          embedding,
+        };
+        embeddedRows.push(row);
+        pendingUpserts.push(row);
+
+        if (pendingUpserts.length >= config.upsertBatchSize) {
+          await store.upsertEmbeddings(
+            pendingUpserts.splice(0, pendingUpserts.length),
+            config.upsertBatchSize,
+          );
+        }
+      }
+
+      if (pendingUpserts.length > 0) {
+        await store.upsertEmbeddings(pendingUpserts, config.upsertBatchSize);
       }
     }
 
-    if (pendingUpserts.length > 0) {
-      await upsertEmbeddings(milvus, config, pendingUpserts);
+    const embeddedByMd5 = new Map(
+      embeddedRows.map((item) => [item.md5, item]),
+    );
+    const clusterInput = [];
+    for (const record of withFiles) {
+      const fromPostgres = existingByMd5.get(record.md5);
+      if (fromPostgres) {
+        clusterInput.push({
+          md5: record.md5,
+          sku: fromPostgres.sku || record.sku,
+          localPath: record.localPath,
+          source: "postgres",
+          embedding: fromPostgres.embedding,
+        });
+        continue;
+      }
+
+      const fromEmbed = embeddedByMd5.get(record.md5);
+      if (fromEmbed) {
+        clusterInput.push(fromEmbed);
+      }
     }
-  }
 
-  const embeddedByMd5 = new Map(
-    embeddedRows.map((item) => [item.md5, item]),
-  );
-  const clusterInput = [];
-  for (const record of withFiles) {
-    const fromMilvus = existingByMd5.get(record.md5);
-    if (fromMilvus) {
-      clusterInput.push({
-        md5: record.md5,
-        sku: fromMilvus.sku || record.sku,
-        localPath: record.localPath,
-        source: "milvus",
-        embedding: fromMilvus.embedding,
-      });
-      continue;
+    const timestamp = new Date().toISOString();
+    const summary = {
+      generatedAt: timestamp,
+      embeddingModel: config.embeddingModel,
+      outputDimensionality: config.outputDimensionality,
+      clusterAlgorithm: config.clusterAlgorithm,
+      clusterThreshold: config.clusterThreshold,
+      totalUniqueVideoMd5: records.length,
+      localFilesFound: withFiles.length,
+      localFilesMissing: missingFiles.length,
+      reusedFromPostgres: clusterInput.filter((item) => item.source === "postgres").length,
+      embeddedThisRun: clusterInput.filter((item) => item.source === "vertex").length,
+      clusteredVideos: clusterInput.length,
+      dryRun: config.dryRun,
+      hasGeminiApiKey: Boolean(config.geminiApiKey),
+      databaseDescription,
+      missingFiles,
+    };
+
+    if (clusterInput.length === 0) {
+      const summaryPath = path.join(config.outputsDir, "video-cluster-summary.json");
+      writeJson(summaryPath, summary);
+      console.log(JSON.stringify({ stage: "done", summaryPath, summary }, null, 2));
+      return;
     }
 
-    const fromEmbed = embeddedByMd5.get(record.md5);
-    if (fromEmbed) {
-      clusterInput.push(fromEmbed);
-    }
-  }
+    const clusterResult = clusterEmbeddings(clusterInput, config);
+    summary.estimatedUniqueVideos = clusterResult.clusters.length;
+    summary.clusterSizes = clusterResult.clusters.map((cluster) => cluster.size);
 
-  const timestamp = new Date().toISOString();
-  const summary = {
-    generatedAt: timestamp,
-    collection: config.milvusCollection,
-    embeddingModel: config.embeddingModel,
-    outputDimensionality: config.outputDimensionality,
-    clusterAlgorithm: config.clusterAlgorithm,
-    clusterThreshold: config.clusterThreshold,
-    totalUniqueVideoMd5: records.length,
-    localFilesFound: withFiles.length,
-    localFilesMissing: missingFiles.length,
-    reusedFromMilvus: clusterInput.filter((item) => item.source === "milvus").length,
-    embeddedThisRun: clusterInput.filter((item) => item.source === "vertex").length,
-    clusteredVideos: clusterInput.length,
-    dryRun: config.dryRun,
-    hasGeminiApiKey: Boolean(config.geminiApiKey),
-    milvusAddress: config.milvusAddress,
-    collectionDescription: {
-      collectionName: collectionDescription.collection_name,
-      dbName: collectionDescription.db_name,
-      md5IsPrimaryKey: Boolean(
-        collectionDescription?.scalar_fields?.md5?.is_primary_key,
-      ),
-      dimension: Number(collectionDescription?.anns_fields?.embedding?.dim || 0),
-      consistencyLevel: collectionDescription.consistency_level,
-    },
-    missingFiles,
-  };
-
-  if (clusterInput.length === 0) {
     const summaryPath = path.join(config.outputsDir, "video-cluster-summary.json");
+    const clustersPath = path.join(config.outputsDir, "video-clusters.json");
+    const pairsPath = path.join(config.outputsDir, "video-similar-pairs.json");
+
     writeJson(summaryPath, summary);
-    console.log(JSON.stringify({ stage: "done", summaryPath, summary }, null, 2));
-    return;
+    writeJson(clustersPath, clusterResult.clusters);
+    writeJson(pairsPath, clusterResult.candidatePairs);
+
+    console.log(
+      JSON.stringify(
+        {
+          stage: "done",
+          summaryPath,
+          clustersPath,
+          pairsPath,
+          summary,
+        },
+        null,
+        2,
+      ),
+    );
+  } finally {
+    await store.close();
   }
-
-  const clusterResult = clusterEmbeddings(clusterInput, config);
-  summary.estimatedUniqueVideos = clusterResult.clusters.length;
-  summary.clusterSizes = clusterResult.clusters.map((cluster) => cluster.size);
-
-  const summaryPath = path.join(config.outputsDir, "video-cluster-summary.json");
-  const clustersPath = path.join(config.outputsDir, "video-clusters.json");
-  const pairsPath = path.join(config.outputsDir, "video-similar-pairs.json");
-
-  writeJson(summaryPath, summary);
-  writeJson(clustersPath, clusterResult.clusters);
-  writeJson(pairsPath, clusterResult.candidatePairs);
-
-  console.log(
-    JSON.stringify(
-      {
-        stage: "done",
-        summaryPath,
-        clustersPath,
-        pairsPath,
-        summary,
-      },
-      null,
-      2,
-    ),
-  );
 }
 
 main().catch((error) => {

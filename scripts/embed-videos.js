@@ -110,7 +110,7 @@ function buildConfig() {
       DEFAULTS.embedRetryBaseDelayMs,
     ),
     skipExistingEmbeddings: readEnvBooleanAny(
-      ["SKIP_EXISTING_EMBEDDINGS", "SKIP_EXISTING_IN_MILVUS"],
+      ["SKIP_EXISTING_EMBEDDINGS"],
       DEFAULTS.skipExistingEmbeddings,
     ),
     audioTrackExtraction: readEnvBoolean(
@@ -147,7 +147,7 @@ function ensureLocalInputs(config) {
   }
   if (!config.fixedSku) {
     throw new Error(
-      "Missing sku. Usage: node scripts/embed-videos-to-postgres.js <sku>",
+      "Missing sku. Usage: node scripts/embed-videos.js <sku>",
     );
   }
   if (!fs.existsSync(config.downloadsDir)) {
